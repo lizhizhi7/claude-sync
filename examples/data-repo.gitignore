@@ -1,0 +1,33 @@
+# claude-sync data repo — allowlist style.
+# Drop this in the root of your private config repo as `.gitignore`.
+# Ignore everything by default, then re-enable what should sync.
+
+*
+
+!.gitignore
+!.claude-sync-data
+!README.md
+
+# Top-level config
+!settings.json
+!CLAUDE.md
+!keybindings.json
+
+# Custom skills
+!skills/
+!skills/**
+
+# Custom MCP servers (code only — keep .venv device-local)
+!mcp-servers/
+!mcp-servers/*/
+!mcp-servers/**
+mcp-servers/*/.venv/
+
+# Project memory
+!projects/
+!projects/*/
+!projects/*/memory/
+!projects/*/memory/**
+
+# Ignore conversation logs and other ephemera
+projects/*/*.jsonl

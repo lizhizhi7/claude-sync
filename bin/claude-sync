@@ -1,0 +1,580 @@
+#!/usr/bin/env bash
+# claude-sync — sync Claude Code config and project memory across devices via git.
+#
+# Tool and data are decoupled:
+#   • This script is the tool. Install it once per machine.
+#   • Your config lives in a private git repo (a "data repo").
+#     Point CLAUDE_SYNC_DIR at it.
+#
+# https://github.com/oliverzli/claude-sync
+
+set -e
+
+# ---------- script resolution ----------
+
+resolve_script_dir() {
+    local path="$1"
+    while [ -L "$path" ]; do
+        local dir
+        dir="$(cd -P "$(dirname "$path")" && pwd)"
+        path="$(readlink "$path")"
+        [[ "$path" != /* ]] && path="$dir/$path"
+    done
+    cd -P "$(dirname "$path")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
+CLAUDE_DIR="$HOME/.claude"
+REMOTE="${CLAUDE_SYNC_REMOTE:-origin}"
+
+# ---------- arg parsing ----------
+
+PREFIX=""
+WORKDIR=""
+WORKDIR_SET=false
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--prefix)  PREFIX="$2"; shift 2 ;;
+        -w|--workdir) WORKDIR="$2"; WORKDIR_SET=true; shift 2 ;;
+        -h|--help)    ARGS+=("help"); shift ;;
+        *)            ARGS+=("$1"); shift ;;
+    esac
+done
+ACTION="${ARGS[0]:-sync}"
+ARG1="${ARGS[1]:-}"
+
+[ "$WORKDIR_SET" = false ] && [ -n "$CLAUDE_SYNC_WORKDIR" ] && WORKDIR="$CLAUDE_SYNC_WORKDIR"
+[ -z "$PREFIX" ] && PREFIX="$(echo "$HOME" | tr '/' '-')"
+[ -n "$WORKDIR" ] && PREFIX="${PREFIX}-$(echo "$WORKDIR" | tr '/' '-')"
+
+# ---------- data repo resolution ----------
+
+is_data_repo() {
+    local dir="$1"
+    [ -f "$dir/.claude-sync-data" ] || \
+    [ -d "$dir/projects" ] || \
+    [ -f "$dir/settings.json" ] || \
+    [ -f "$dir/CLAUDE.md" ] || \
+    [ -d "$dir/skills" ]
+}
+
+resolve_repo_dir() {
+    if [ -n "$CLAUDE_SYNC_DIR" ]; then
+        if [ ! -d "$CLAUDE_SYNC_DIR" ]; then
+            echo "ERROR: CLAUDE_SYNC_DIR=$CLAUDE_SYNC_DIR does not exist." >&2
+            exit 1
+        fi
+        ( cd "$CLAUDE_SYNC_DIR" && pwd )
+        return
+    fi
+    local candidate
+    candidate="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd || true)"
+    if [ -n "$candidate" ] && is_data_repo "$candidate"; then
+        echo "$candidate"
+        return
+    fi
+    echo "ERROR: cannot locate your claude-sync data directory." >&2
+    echo "" >&2
+    echo "  Set CLAUDE_SYNC_DIR to your private config repo:" >&2
+    echo "    export CLAUDE_SYNC_DIR=\"\$HOME/path/to/your/config\"" >&2
+    echo "" >&2
+    echo "  Or initialize a new one:" >&2
+    echo "    claude-sync init ~/path/to/your/config" >&2
+    exit 1
+}
+
+# ---------- helpers ----------
+
+make_link() {
+    local target="$1" link_path="$2"
+    local link_dir link_name
+    link_dir="$(dirname "$link_path")"
+    link_name="$(basename "$link_path")"
+    mkdir -p "$link_dir"
+    rm -rf "$link_path"
+    ( cd "$link_dir" && ln -s -- "$target" "$link_name" )
+}
+
+git_branch() {
+    git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null
+}
+
+require_remote() {
+    if ! git -C "$REPO_DIR" remote get-url "$REMOTE" >/dev/null 2>&1; then
+        echo "ERROR: git remote '$REMOTE' not configured in $REPO_DIR." >&2
+        echo "  Add one with:" >&2
+        echo "    git -C \"$REPO_DIR\" remote add $REMOTE git@github.com:USER/REPO.git" >&2
+        exit 1
+    fi
+}
+
+git_pull_rebase() {
+    local branch
+    branch="$(git_branch)"
+    if ! git -C "$REPO_DIR" pull --rebase "$REMOTE" "$branch"; then
+        echo "" >&2
+        echo "ERROR: rebase failed in $REPO_DIR." >&2
+        echo "  resolve conflicts then run: git -C \"$REPO_DIR\" rebase --continue" >&2
+        echo "  or to abandon:              git -C \"$REPO_DIR\" rebase --abort" >&2
+        exit 1
+    fi
+}
+
+# ---------- linking ----------
+
+link_configs() {
+    mkdir -p "$CLAUDE_DIR"
+    local f
+    for f in settings.json keybindings.json CLAUDE.md; do
+        if [ -f "$REPO_DIR/$f" ]; then
+            make_link "$REPO_DIR/$f" "$CLAUDE_DIR/$f"
+            echo "  linked $f"
+        fi
+    done
+    if [ -d "$REPO_DIR/skills" ]; then
+        make_link "$REPO_DIR/skills" "$CLAUDE_DIR/skills"
+        echo "  linked skills/"
+    fi
+    if [ -d "$REPO_DIR/mcp-servers" ]; then
+        mkdir -p "$CLAUDE_DIR/mcp-servers"
+        local srv_dir srv_name target venv_backup inner
+        for srv_dir in "$REPO_DIR"/mcp-servers/*/; do
+            [ ! -d "$srv_dir" ] && continue
+            srv_name="$(basename "$srv_dir")"
+            target="$CLAUDE_DIR/mcp-servers/$srv_name"
+            if [ -d "$target/.venv" ]; then
+                venv_backup="$(mktemp -d)"
+                mv "$target/.venv" "$venv_backup/.venv"
+                rm -rf "$target"
+                mkdir -p "$target"
+                for inner in "$srv_dir"*; do
+                    [ ! -e "$inner" ] && continue
+                    ln -sf "$inner" "$target/$(basename "$inner")"
+                done
+                mv "$venv_backup/.venv" "$target/.venv"
+                rm -rf "$venv_backup"
+            else
+                rm -rf "$target"
+                mkdir -p "$target"
+                for inner in "$srv_dir"*; do
+                    [ ! -e "$inner" ] && continue
+                    ln -sf "$inner" "$target/$(basename "$inner")"
+                done
+            fi
+            echo "  linked mcp-server: $srv_name"
+        done
+    fi
+}
+
+link_projects() {
+    mkdir -p "$CLAUDE_DIR/projects"
+    local count=0 canonical_mem canonical device_name
+    for canonical_mem in "$REPO_DIR"/projects/*/memory; do
+        [ ! -d "$canonical_mem" ] && continue
+        canonical="$(basename "$(dirname "$canonical_mem")")"
+
+        mkdir -p "$CLAUDE_DIR/projects/$canonical"
+        [ ! -L "$CLAUDE_DIR/projects/$canonical/memory" ] \
+            && rm -rf "$CLAUDE_DIR/projects/$canonical/memory"
+        make_link "$canonical_mem" "$CLAUDE_DIR/projects/$canonical/memory"
+
+        if [ "$canonical" = "_home" ]; then
+            device_name="$PREFIX"
+        else
+            device_name="${PREFIX}${canonical}"
+        fi
+        mkdir -p "$CLAUDE_DIR/projects/$device_name"
+        [ ! -L "$CLAUDE_DIR/projects/$device_name/memory" ] \
+            && rm -rf "$CLAUDE_DIR/projects/$device_name/memory"
+        make_link "$canonical_mem" "$CLAUDE_DIR/projects/$device_name/memory"
+
+        count=$((count + 1))
+    done
+    [ "$count" -gt 0 ] && echo "  linked memory for $count project(s)"
+    return 0
+}
+
+migrate_local_memory() {
+    [ ! -d "$CLAUDE_DIR/projects" ] && return 0
+    local count=0 device_mem device_dir canonical
+    for device_mem in "$CLAUDE_DIR/projects/${PREFIX}"-*/memory; do
+        [ ! -d "$device_mem" ] && continue
+        [ -L "$device_mem" ] && continue
+        device_dir="$(basename "$(dirname "$device_mem")")"
+        canonical="${device_dir#"$PREFIX"}"
+        mkdir -p "$REPO_DIR/projects/$canonical/memory"
+        cp -Rn "$device_mem/"* "$REPO_DIR/projects/$canonical/memory/" 2>/dev/null || true
+        count=$((count + 1))
+    done
+    if [ -d "$CLAUDE_DIR/projects/$PREFIX/memory" ] \
+       && [ ! -L "$CLAUDE_DIR/projects/$PREFIX/memory" ]; then
+        mkdir -p "$REPO_DIR/projects/_home/memory"
+        cp -Rn "$CLAUDE_DIR/projects/$PREFIX/memory/"* "$REPO_DIR/projects/_home/memory/" 2>/dev/null || true
+        count=$((count + 1))
+    fi
+    [ "$count" -gt 0 ] && echo "  migrated memory from $count local project(s)"
+    return 0
+}
+
+clean_projects() {
+    [ ! -d "$CLAUDE_DIR/projects" ] && return 0
+    local count=0 mem_link proj_dir
+    for mem_link in "$CLAUDE_DIR"/projects/*/memory; do
+        [ ! -L "$mem_link" ] && continue
+        if [ ! -e "$mem_link" ]; then
+            proj_dir="$(dirname "$mem_link")"
+            rm -f "$mem_link"
+            rmdir "$proj_dir" 2>/dev/null || true
+            count=$((count + 1))
+        fi
+    done
+    [ "$count" -gt 0 ] && echo "  cleaned $count broken symlink(s)"
+    return 0
+}
+
+do_link() {
+    echo "Linking $REPO_DIR (prefix: $PREFIX) ..."
+    migrate_local_memory
+    clean_projects
+    link_configs
+    link_projects
+    echo "Done."
+}
+
+do_unlink() {
+    echo "Unlinking claude-sync from $CLAUDE_DIR ..."
+    local removed=0 dest f target srv_dir srv_name touched inner mem_link
+    for f in settings.json keybindings.json CLAUDE.md skills; do
+        target="$CLAUDE_DIR/$f"
+        if [ -L "$target" ]; then
+            dest="$(readlink "$target")"
+            case "$dest" in
+                "$REPO_DIR"*) rm -f "$target"; echo "  unlinked $f"; removed=$((removed+1)) ;;
+            esac
+        fi
+    done
+    if [ -d "$CLAUDE_DIR/mcp-servers" ]; then
+        for srv_dir in "$CLAUDE_DIR"/mcp-servers/*/; do
+            [ ! -d "$srv_dir" ] && continue
+            srv_name="$(basename "$srv_dir")"
+            touched=false
+            for inner in "$srv_dir"*; do
+                [ ! -e "$inner" ] && [ ! -L "$inner" ] && continue
+                if [ -L "$inner" ]; then
+                    dest="$(readlink "$inner")"
+                    case "$dest" in
+                        "$REPO_DIR"*) rm -f "$inner"; touched=true ;;
+                    esac
+                fi
+            done
+            if [ -z "$(ls -A "$srv_dir" 2>/dev/null)" ]; then
+                rmdir "$srv_dir" 2>/dev/null || true
+            fi
+            if [ "$touched" = true ]; then
+                echo "  unlinked mcp-server: $srv_name"
+                removed=$((removed+1))
+            fi
+        done
+        rmdir "$CLAUDE_DIR/mcp-servers" 2>/dev/null || true
+    fi
+    if [ -d "$CLAUDE_DIR/projects" ]; then
+        for mem_link in "$CLAUDE_DIR"/projects/*/memory; do
+            [ ! -L "$mem_link" ] && continue
+            dest="$(readlink "$mem_link")"
+            case "$dest" in
+                "$REPO_DIR"*)
+                    rm -f "$mem_link"
+                    rmdir "$(dirname "$mem_link")" 2>/dev/null || true
+                    removed=$((removed+1))
+                    ;;
+            esac
+        done
+    fi
+    if [ "$removed" -eq 0 ]; then
+        echo "  nothing to unlink."
+    else
+        echo "Unlinked $removed item(s). Repo at $REPO_DIR is intact."
+    fi
+}
+
+do_init() {
+    local target="$ARG1"
+    if [ -z "$target" ]; then
+        echo "Usage: claude-sync init <directory>" >&2
+        exit 1
+    fi
+    if [ -e "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
+        echo "ERROR: $target is not empty." >&2
+        exit 1
+    fi
+    mkdir -p "$target"
+    target="$(cd "$target" && pwd)"
+    if [ ! -d "$target/.git" ]; then
+        git -C "$target" init -q -b main 2>/dev/null || git -C "$target" init -q
+    fi
+    cat > "$target/.gitignore" <<'EOF'
+# claude-sync data repo — allowlist style.
+# Ignore everything by default, then re-enable what should sync.
+*
+
+!.gitignore
+!.claude-sync-data
+!README.md
+
+# Top-level config
+!settings.json
+!CLAUDE.md
+!keybindings.json
+
+# Custom skills
+!skills/
+!skills/**
+
+# Custom MCP servers (code only — keep .venv device-local)
+!mcp-servers/
+!mcp-servers/*/
+!mcp-servers/**
+mcp-servers/*/.venv/
+
+# Project memory
+!projects/
+!projects/*/
+!projects/*/memory/
+!projects/*/memory/**
+
+# Ignore conversation logs and other ephemera
+projects/*/*.jsonl
+EOF
+    touch "$target/.claude-sync-data"
+    echo "Initialized claude-sync data repo at $target"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Add to your shell profile (e.g. ~/.zshrc):"
+    echo "       export CLAUDE_SYNC_DIR=\"$target\""
+    [ -n "$WORKDIR" ] && echo "       export CLAUDE_SYNC_WORKDIR=\"$WORKDIR\""
+    echo "  2. Add a private remote (recommended):"
+    echo "       git -C \"$target\" remote add origin git@github.com:USER/REPO.git"
+    echo "  3. Set up symlinks:"
+    echo "       CLAUDE_SYNC_DIR=\"$target\" claude-sync link"
+}
+
+print_usage() {
+    cat <<'USAGE'
+Usage: claude-sync [-p PREFIX] [-w WORKDIR] <command>
+
+Commands:
+  init <dir>   initialize a new data repo at <dir>
+  sync         pull + push + link (default)
+  push         commit and push local changes
+  pull         pull remote changes + link
+  link         set up / refresh symlinks
+  unlink       remove repo-owned symlinks (keeps repo)
+  clean        remove broken symlinks from ~/.claude/projects
+  status       show repo, projects, link health, and changes
+  help         show this message
+
+Options:
+  -p, --prefix PREFIX   device prefix (default: auto from $HOME)
+  -w, --workdir DIR     work directory under $HOME (default: $CLAUDE_SYNC_WORKDIR)
+
+Environment:
+  CLAUDE_SYNC_DIR       path to your private config repo (required for all
+                        commands except `init`, unless you run from inside
+                        a data repo that already contains bin/claude-sync)
+  CLAUDE_SYNC_WORKDIR   parent dir under $HOME to strip from canonical
+                        project names (e.g. "develop" strips ~/develop/)
+  CLAUDE_SYNC_REMOTE    git remote name (default: origin)
+
+The branch your data repo is currently on is used for push/pull, so
+`main`, `master`, or any other branch works.
+USAGE
+}
+
+# ---------- dispatch ----------
+
+case "$ACTION" in
+    init)
+        do_init
+        exit 0
+        ;;
+    help)
+        print_usage
+        exit 0
+        ;;
+esac
+
+REPO_DIR="$(resolve_repo_dir)"
+
+case "$ACTION" in
+    link)
+        do_link
+        ;;
+    unlink|uninstall)
+        do_unlink
+        ;;
+    push)
+        cd "$REPO_DIR"
+        require_remote
+        migrate_local_memory
+        git add -A
+        if git diff --cached --quiet; then
+            echo "Nothing to push."
+        else
+            git commit -m "sync: $(hostname) $(date '+%Y-%m-%d %H:%M')"
+            git push "$REMOTE" "$(git_branch)"
+            echo "Pushed."
+        fi
+        ;;
+    pull)
+        cd "$REPO_DIR"
+        require_remote
+        git_pull_rebase
+        do_link
+        echo "Pulled."
+        ;;
+    sync)
+        cd "$REPO_DIR"
+        require_remote
+        migrate_local_memory
+        git add -A
+        if ! git diff --cached --quiet; then
+            git commit -m "sync: $(hostname) $(date '+%Y-%m-%d %H:%M')"
+        fi
+        git_pull_rebase
+        git push "$REMOTE" "$(git_branch)"
+        do_link
+        echo "Synced."
+        ;;
+    clean)
+        echo "Cleaning broken symlinks ..."
+        clean_projects
+        echo "Done."
+        ;;
+    status)
+        cd "$REPO_DIR"
+        echo "Repo:    $REPO_DIR"
+        echo "Prefix:  $PREFIX"
+        [ -n "$WORKDIR" ] && echo "Workdir: ~/$WORKDIR"
+        if git remote get-url "$REMOTE" >/dev/null 2>&1; then
+            echo "Remote:  $REMOTE ($(git remote get-url "$REMOTE"))"
+            echo "Branch:  $(git_branch)"
+        else
+            echo "Remote:  (none configured)"
+        fi
+        echo ""
+
+        echo "Projects:"
+        for canonical_mem in "$REPO_DIR"/projects/*/memory; do
+            [ ! -d "$canonical_mem" ] && continue
+            proj="$(basename "$(dirname "$canonical_mem")")"
+            echo "  $proj"
+        done
+        echo ""
+
+        if [ -d "$REPO_DIR/skills" ]; then
+            skill_list=""
+            for skill_dir in "$REPO_DIR"/skills/*/; do
+                [ ! -d "$skill_dir" ] && continue
+                skill_list="$skill_list  $(basename "$skill_dir")"$'\n'
+            done
+            if [ -n "$skill_list" ]; then
+                echo "Skills:"
+                printf '%s' "$skill_list"
+                echo ""
+            fi
+        fi
+
+        if [ -d "$REPO_DIR/mcp-servers" ]; then
+            srv_list=""
+            for srv_dir in "$REPO_DIR"/mcp-servers/*/; do
+                [ ! -d "$srv_dir" ] && continue
+                srv_list="$srv_list  $(basename "$srv_dir")"$'\n'
+            done
+            if [ -n "$srv_list" ]; then
+                echo "MCP Servers:"
+                printf '%s' "$srv_list"
+                echo ""
+            fi
+        fi
+
+        health_lines=""
+        check_link() {
+            local label="$1" target="$2" expect_prefix="$3"
+            if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+                health_lines="${health_lines}  missing      $label"$'\n'
+            elif [ ! -L "$target" ]; then
+                health_lines="${health_lines}  not-symlink  $label"$'\n'
+            elif [ ! -e "$target" ]; then
+                health_lines="${health_lines}  broken       $label"$'\n'
+            else
+                local dest
+                dest="$(readlink "$target")"
+                case "$dest" in
+                    "$expect_prefix"*) : ;;
+                    *) health_lines="${health_lines}  foreign      $label -> $dest"$'\n' ;;
+                esac
+            fi
+        }
+        for f in settings.json keybindings.json CLAUDE.md; do
+            [ -f "$REPO_DIR/$f" ] && check_link "$f" "$CLAUDE_DIR/$f" "$REPO_DIR/"
+        done
+        [ -d "$REPO_DIR/skills" ] && check_link "skills" "$CLAUDE_DIR/skills" "$REPO_DIR/"
+        for canonical_mem in "$REPO_DIR"/projects/*/memory; do
+            [ ! -d "$canonical_mem" ] && continue
+            canonical="$(basename "$(dirname "$canonical_mem")")"
+            if [ "$canonical" = "_home" ]; then
+                device_name="$PREFIX"
+            else
+                device_name="${PREFIX}${canonical}"
+            fi
+            check_link "projects/$canonical" "$CLAUDE_DIR/projects/$device_name/memory" "$REPO_DIR/"
+        done
+        if [ -n "$health_lines" ]; then
+            echo "Link health:"
+            printf '%s' "$health_lines"
+            echo "  (run \`claude-sync link\` to repair)"
+            echo ""
+        fi
+
+        changes="$(git status --short)"
+        if [ -z "$changes" ]; then
+            echo "No changes."
+        else
+            echo "Changes:"
+            shown_projects=""
+            other_lines=""
+            while IFS= read -r line; do
+                file="${line:3}"
+                matched=false
+                for canonical_mem in "$REPO_DIR"/projects/*/memory; do
+                    [ ! -d "$canonical_mem" ] && continue
+                    proj="$(basename "$(dirname "$canonical_mem")")"
+                    if [[ "$file" == projects/"$proj"/* ]]; then
+                        if [[ " $shown_projects " != *" $proj "* ]]; then
+                            echo "  [$proj]"
+                            shown_projects="$shown_projects $proj"
+                        fi
+                        echo "    ${line:0:2} ${file#projects/$proj/}"
+                        matched=true
+                        break
+                    fi
+                done
+                if [ "$matched" = false ]; then
+                    other_lines="${other_lines}${line}"$'\n'
+                fi
+            done <<< "$changes"
+            if [ -n "$other_lines" ]; then
+                echo "  [config]"
+                while IFS= read -r line; do
+                    [ -z "$line" ] && continue
+                    echo "    $line"
+                done <<< "$other_lines"
+            fi
+        fi
+        ;;
+    *)
+        print_usage
+        exit 1
+        ;;
+esac
