@@ -6,7 +6,7 @@
 #   • Your config lives in a private git repo (a "data repo").
 #     Point CLAUDE_SYNC_DIR at it.
 #
-# https://github.com/oliverzli/claude-sync
+# https://github.com/lizhizhi7/claude-sync
 
 set -e
 
@@ -50,38 +50,22 @@ ARG1="${ARGS[1]:-}"
 
 # ---------- data repo resolution ----------
 
-is_data_repo() {
-    local dir="$1"
-    [ -f "$dir/.claude-sync-data" ] || \
-    [ -d "$dir/projects" ] || \
-    [ -f "$dir/settings.json" ] || \
-    [ -f "$dir/CLAUDE.md" ] || \
-    [ -d "$dir/skills" ]
-}
-
 resolve_repo_dir() {
-    if [ -n "$CLAUDE_SYNC_DIR" ]; then
-        if [ ! -d "$CLAUDE_SYNC_DIR" ]; then
-            echo "ERROR: CLAUDE_SYNC_DIR=$CLAUDE_SYNC_DIR does not exist." >&2
-            exit 1
-        fi
-        ( cd "$CLAUDE_SYNC_DIR" && pwd )
-        return
+    if [ -z "$CLAUDE_SYNC_DIR" ]; then
+        echo "ERROR: CLAUDE_SYNC_DIR is not set." >&2
+        echo "" >&2
+        echo "  Point it at your private config repo:" >&2
+        echo "    export CLAUDE_SYNC_DIR=\"\$HOME/path/to/your/config\"" >&2
+        echo "" >&2
+        echo "  Or initialize a new one:" >&2
+        echo "    claude-sync init ~/path/to/your/config" >&2
+        exit 1
     fi
-    local candidate
-    candidate="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd || true)"
-    if [ -n "$candidate" ] && is_data_repo "$candidate"; then
-        echo "$candidate"
-        return
+    if [ ! -d "$CLAUDE_SYNC_DIR" ]; then
+        echo "ERROR: CLAUDE_SYNC_DIR=$CLAUDE_SYNC_DIR does not exist." >&2
+        exit 1
     fi
-    echo "ERROR: cannot locate your claude-sync data directory." >&2
-    echo "" >&2
-    echo "  Set CLAUDE_SYNC_DIR to your private config repo:" >&2
-    echo "    export CLAUDE_SYNC_DIR=\"\$HOME/path/to/your/config\"" >&2
-    echo "" >&2
-    echo "  Or initialize a new one:" >&2
-    echo "    claude-sync init ~/path/to/your/config" >&2
-    exit 1
+    ( cd "$CLAUDE_SYNC_DIR" && pwd )
 }
 
 # ---------- helpers ----------
@@ -379,9 +363,8 @@ Options:
   -w, --workdir DIR     work directory under $HOME (default: $CLAUDE_SYNC_WORKDIR)
 
 Environment:
-  CLAUDE_SYNC_DIR       path to your private config repo (required for all
-                        commands except `init`, unless you run from inside
-                        a data repo that already contains bin/claude-sync)
+  CLAUDE_SYNC_DIR       path to your private config repo (required for
+                        every command except `init` and `help`)
   CLAUDE_SYNC_WORKDIR   parent dir under $HOME to strip from canonical
                         project names (e.g. "develop" strips ~/develop/)
   CLAUDE_SYNC_REMOTE    git remote name (default: origin)

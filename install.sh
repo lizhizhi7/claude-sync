@@ -2,7 +2,7 @@
 # claude-sync installer.
 #
 # Defaults:
-#   tool repo : https://github.com/oliverzli/claude-sync.git
+#   tool repo : https://github.com/lizhizhi7/claude-sync.git
 #   install   : ~/.local/share/claude-sync
 #   bin       : ~/.local/bin/claude-sync
 #
@@ -11,7 +11,7 @@
 
 set -e
 
-REPO="${CLAUDE_SYNC_REPO:-https://github.com/oliverzli/claude-sync.git}"
+REPO="${CLAUDE_SYNC_REPO:-https://github.com/lizhizhi7/claude-sync.git}"
 INSTALL_DIR="${CLAUDE_SYNC_INSTALL_DIR:-$HOME/.local/share/claude-sync}"
 BIN_DIR="${CLAUDE_SYNC_BIN_DIR:-$HOME/.local/bin}"
 

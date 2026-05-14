@@ -39,13 +39,13 @@ Settings, skills, `CLAUDE.md`, and MCP servers are symlinked from `~/.claude/` d
 One-line installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oliverzli/claude-sync/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lizhizhi7/claude-sync/main/install.sh | bash
 ```
 
 Or clone manually:
 
 ```bash
-git clone https://github.com/oliverzli/claude-sync.git ~/.local/share/claude-sync
+git clone https://github.com/lizhizhi7/claude-sync.git ~/.local/share/claude-sync
 ln -sfn ~/.local/share/claude-sync/bin/claude-sync ~/.local/bin/claude-sync
 # make sure ~/.local/bin is on your $PATH
 ```
@@ -96,7 +96,7 @@ Requires `bash`, `git`. Tested on macOS and Linux.
 
 ```bash
 # install the tool (same one-liner as above)
-curl -fsSL https://raw.githubusercontent.com/oliverzli/claude-sync/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lizhizhi7/claude-sync/main/install.sh | bash
 
 # clone your config repo
 git clone git@github.com:you/claude-config.git ~/dotfiles/claude-config
@@ -125,7 +125,7 @@ claude-sync help         show usage
 
 | Env var | Meaning |
 |---|---|
-| `CLAUDE_SYNC_DIR` | Path to your private config repo. Required for all commands except `init` (unless the script lives inside the data repo, for backward compatibility). |
+| `CLAUDE_SYNC_DIR` | Path to your private config repo. Required for every command except `init` and `help`. |
 | `CLAUDE_SYNC_WORKDIR` | Parent directory under `$HOME` to strip from canonical project names. e.g. `develop` strips `~/develop/` from paths. Per-device. |
 | `CLAUDE_SYNC_REMOTE` | Git remote name (default `origin`). |
 
